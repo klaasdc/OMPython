@@ -53,6 +53,7 @@ from collections import OrderedDict
 import numpy as np
 import pyparsing
 
+from subprocess import DEVNULL
 
 if sys.platform == 'darwin':
     # On Mac let's assume omc is installed here and there might be a broken omniORB installed in a bad place
@@ -125,7 +126,7 @@ class OMCSessionHelper():
 
 class OMCSessionBase(with_metaclass(abc.ABCMeta, object)):
 
-    def __init__(self, readonly=False):
+    def __init__(self, readonly=False, workingDir=None):
         self.readonly = readonly
         self.omc_cache = {}
         self._omc_process = None
@@ -137,6 +138,7 @@ class OMCSessionBase(with_metaclass(abc.ABCMeta, object)):
         self._random_string = uuid.uuid4().hex
         # omc log file
         self._omc_log_file = None
+        self.workingDir = workingDir
 
     def __del__(self):
         try:
@@ -181,24 +183,14 @@ class OMCSessionBase(with_metaclass(abc.ABCMeta, object)):
             omhome_bin = os.path.join(self.omhome, 'bin').replace("\\", "/")
             my_env = os.environ.copy()
             my_env["PATH"] = omhome_bin + os.pathsep + my_env["PATH"]
-            self._omc_process = subprocess.Popen(self._omc_command, stdout=self._omc_log_file, stderr=self._omc_log_file, env=my_env)
+            self._omc_process = subprocess.Popen(self._omc_command, shell=True, stdout=self._omc_log_file, stderr=self._omc_log_file, env=my_env, cwd=self.workingDir)
         else:
             # Because we spawned a shell, and we need to be able to kill OMC, create a new process group for this
-            self._omc_process = subprocess.Popen(self._omc_command, shell=True, stdout=self._omc_log_file, stderr=self._omc_log_file, preexec_fn=os.setsid)
+            self._omc_process = subprocess.Popen(self._omc_command, shell=True, stdout=self._omc_log_file, stderr=self._omc_log_file, preexec_fn=os.setsid, cwd=self.workingDir)
         return self._omc_process
 
-    def _set_omc_command(self, omc_path_and_args_list):
-        """Define the command that will be called by the subprocess module.
-
-        On Windows, use the list input style of the subprocess module to
-        avoid problems resulting from spaces in the path string.
-        Linux, however, only works with the string version.
-        """
-        if sys.platform == 'win32':
-            self._omc_command = omc_path_and_args_list
-        else:
-            self._omc_command = ' '.join(omc_path_and_args_list)
-
+    def _set_omc_command(self, omc_path, args):
+        self._omc_command = "{0} {1}".format(omc_path, args)
         return self._omc_command
 
     @abc.abstractmethod
@@ -435,14 +427,12 @@ class OMCSessionBase(with_metaclass(abc.ABCMeta, object)):
 
 class OMCSession(OMCSessionHelper, OMCSessionBase):
 
-    def __init__(self, readonly=False, serverFlag='--interactive=corba', timeout = 0.25):
+    def __init__(self, workingDir, readonly=False, serverFlag='--interactive=corba', timeout = 0.25):
         OMCSessionHelper.__init__(self)
-        OMCSessionBase.__init__(self, readonly)
+        OMCSessionBase.__init__(self, readonly=readonly, workingDir=workingDir)
         self._create_omc_log_file("objid")
         # set omc executable path and args
-        self._set_omc_command([self._get_omc_path(),
-                               serverFlag,
-                               "+c={0}".format(self._random_string)])
+        self._set_omc_command(self._get_omc_path(), "{0} +c={1}".format(serverFlag, self._random_string))
         # start up omc executable, which is waiting for the CORBA connection
         self._start_omc_process()
         # connect to the running omc instance using CORBA
@@ -545,14 +535,12 @@ class OMCSession(OMCSessionHelper, OMCSessionBase):
 
 class OMCSessionZMQ(OMCSessionHelper, OMCSessionBase):
 
-    def __init__(self, readonly=False, timeout = 0.25):
+    def __init__(self, readonly=False, timeout = 0.25, workingDir=None):
         OMCSessionHelper.__init__(self)
-        OMCSessionBase.__init__(self, readonly)
+        OMCSessionBase.__init__(self, readonly, workingDir)
         self._create_omc_log_file("port")
         # set omc executable path and args
-        self._set_omc_command([self._get_omc_path(),
-                               "--interactive=zmq",
-                               "+z={0}".format(self._random_string)])
+        self._set_omc_command(self._get_omc_path(), "--interactive=zmq +z={0}".format(self._random_string))
         # start up omc executable, which is waiting for the CORBA connection
         self._start_omc_process()
         # connect to the running omc instance using CORBA
@@ -634,7 +622,7 @@ class OMCSessionZMQ(OMCSessionHelper, OMCSessionBase):
 
 
 class ModelicaSystem(object):
-    def __init__(self, fileName=None, modelName=None, lmodel=[], useCorba=False, commandLineOptions=None):  # 1
+    def __init__(self, fileName=None, modelName=None, lmodel=[], useCorba=False, workingDir=None):  # 1
         """
         "constructor"
         It initializes to load file and build a model, generating object, exe, xml, mat, and json files. etc. It can be called :
@@ -649,8 +637,13 @@ class ModelicaSystem(object):
             if useCorba:
                 self.getconn = OMCSession()
             else:
-                self.getconn = OMCSessionZMQ()
+                self.getconn = OMCSessionZMQ(workingDir=workingDir)
             return
+            
+        if workingDir is None:
+            self.workingDir = os.getcwd()
+        else:
+            self.workingDir = workingDir
 
         if fileName is None:
             return "File does not exist"
@@ -675,13 +668,8 @@ class ModelicaSystem(object):
         if useCorba:
             self.getconn = OMCSession()
         else:
-            self.getconn = OMCSessionZMQ()
-            
-        ## set commandLineOptions if provided by users
-        if commandLineOptions is not None:
-            exp="".join(["setCommandLineOptions(","\"",commandLineOptions,"\"",")"])
-            self.getconn.sendExpression(exp)
-    
+            self.getconn = OMCSessionZMQ(workingDir=self.workingDir)
+        
         self.xmlFile = None
         self.lmodel = lmodel  # may be needed if model is derived from other model
         self.modelName = modelName  # Model class name
@@ -692,28 +680,28 @@ class ModelicaSystem(object):
         self.outputFlag = False
         self.csvFile = ''  # for storing inputs condition
         self.resultfile="" # for storing result file
-        if not os.path.exists(self.fileName):  # if file does not eixt
-            print("File Error:" + os.path.abspath(self.fileName) + " does not exist!!!")
+        if not os.path.exists(os.path.join(self.workingDir, self.fileName)):  # if file does not eixt
+            print("File Error:" + os.path.join(self.workingDir, self.fileName) + " does not exist!!!")
             return
 
         (head, tail) = os.path.split(self.fileName)  # to store directory/path and file)
-        self.currDir = os.getcwd()
+#        self.currDir = os.getcwd()
         self.modelDir = head
         self.fileName_ = tail
 
         if not self.modelDir:
-            file_ = os.path.exists(self.fileName_)
+            file_ = os.path.exists(os.path.join(self.workingDir, self.fileName))
             if (file_):  # execution from path where file is located
                 self.__loadingModel()
             else:
                 print("Error: File does not exist!!!")
 
         else:
-            os.chdir(self.modelDir)
-            file_ = os.path.exists(self.fileName_)
+#            os.chdir(self.modelDir)
+            file_ = os.path.exists(os.path.join(self.workingDir, self.fileName))
             self.model = self.fileName_[:-3]
             if (self.fileName_):  # execution from different path
-                os.chdir(self.currDir)
+#                os.chdir(self.currDir)
                 self.__loadingModel()
             else:
                 print("Error: File does not exist!!!")
@@ -1083,9 +1071,9 @@ class ModelicaSystem(object):
             csvinput=""
 
         if (platform.system() == "Windows"):
-            getExeFile = os.path.join(os.getcwd(), '{}.{}'.format(self.modelName, "exe")).replace("\\", "/")
+            getExeFile = os.path.join(self.workingDir, '{}.{}'.format(self.modelName, "exe")).replace("\\", "/")
         else:
-            getExeFile = os.path.join(os.getcwd(), self.modelName).replace("\\", "/")
+            getExeFile = os.path.join(self.workingDir, self.modelName).replace("\\", "/")
         
         if (os.path.exists(getExeFile)):
             cmd = getExeFile + override + csvinput + r + simflags
@@ -1094,8 +1082,15 @@ class ModelicaSystem(object):
                 omhome = os.path.join(os.environ.get("OPENMODELICAHOME"), 'bin').replace("\\", "/")
                 my_env = os.environ.copy()
                 my_env["PATH"] = omhome + os.pathsep + my_env["PATH"]
-                p = subprocess.Popen(cmd, env=my_env)
-                p.wait()
+                s = False
+                from subprocess import TimeoutExpired
+                while not s:
+                    try:
+                        p = subprocess.Popen(cmd, env=my_env, stdout=DEVNULL, cwd=self.workingDir)
+                        p.wait(timeout=2)
+                        s = True
+                    except TimeoutExpired:
+                        print("Retry")
                 p.terminate()
             else:
                 os.system(cmd)  
@@ -1124,7 +1119,7 @@ class ModelicaSystem(object):
             resFile = resultfile   
             
         # check for result file exits
-        if (not os.path.exists(resFile)):
+        if not os.path.exists(os.path.join(self.workingDir, resFile)):
             print("Error: Result file does not exist")
             return
             #exit()
